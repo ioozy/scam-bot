@@ -1,10 +1,15 @@
-from flask import Flask, request, abort
 import json, os, requests, logging, traceback, re
 from dotenv import load_dotenv
 from collections import defaultdict 
-import hmac, hashlib, base64
+from flask import Flask, request, abort
 from linebot import LineBotApi
-from linebot.models import FlexSendMessage
+from linebot.models import (
+    TextSendMessage,
+    FlexSendMessage,
+    QuickReply, QuickReplyButton, MessageAction
+)
+import hmac, hashlib, base64, json, os, logging
+
 
 load_dotenv()    # 只呼叫一次
 
@@ -163,17 +168,16 @@ LABEL_DESC = {
     "authority": ("認知偏誤：權威依從", "冒充政府/銀行增加可信度"),
 }
 
-def build_flex_result(result: dict) -> FlexSendMessage:
+def build_flex_bubble(result: dict) -> dict:
     stage_num = result["stage"]
     s_name, advice = STAGE_INFO.get(stage_num, ("未知", ""))
-    # 把 LABEL_DESC 轉成「情緒觸發：…、經濟榨取：…」這樣的字串
     reasons = "、".join(
         f"{title}：{desc}"
         for lab in result.get("labels", [])
         for title, desc in [LABEL_DESC.get(lab, (lab, ""))]
     ) or "無風險標籤"
 
-    bubble = {
+    return {
       "type":"bubble",
       "body":{
         "type":"box","layout":"vertical","contents":[
@@ -193,26 +197,14 @@ def build_flex_result(result: dict) -> FlexSendMessage:
         ]
       }
     }
-    return FlexSendMessage(alt_text="詐騙偵測結果", contents=bubble)
-
-#def generate_reply(result: dict) -> str:
-    stage = result["stage"]
-    s_name, advice = STAGE_INFO.get(stage, ("未知", ""))
-    # 先把 tuple[0] （title）抽出來再 join
-    labels = result.get("labels", [])
-    reasons_list = []
-    for l in labels:
-        tup = LABEL_DESC.get(l)
-        if isinstance(tup, tuple):
-            reasons_list.append(tup[0])   # 取 tuple 的第一欄
-        else:
-            reasons_list.append(str(l))   # fallback
-    reasons = "、".join(reasons_list) if reasons_list else "無風險標籤"
-
-    return (
-        f"🔎 目前階段：{stage}（{s_name}）\n"
-        f"📌 觸發因子：{reasons}\n"
-        f"👉 建議行動：{advice}"
+    # FlexSendMessage＋quickReply
+    return FlexSendMessage(
+      alt_text="詐騙偵測結果",
+      contents=bubble,
+      quick_reply=QuickReply(items=[
+        QuickReplyButton(action=MessageAction(label="下一段偵測", text="下一段偵測")),
+        QuickReplyButton(action=MessageAction(label="聊聊更多", text="聊聊更多")),
+      ])
     )
 
 # 每個label的說明
@@ -325,61 +317,123 @@ user_chat_history = {}  # key: userId, value: list of text messages
 # === 回傳訊息給使用者（使用 reply API） ===
 
 def reply_text(token, text):
-    line_bot_api.reply_message(token, TextSendMessage(text=text))
+    msg = TextSendMessage(text=text, quick_reply=COMMON_QR)
+    line_bot_api.reply_message(token, msg)
 
-def reply_flex(token, flex: FlexSendMessage):
-    line_bot_api.reply_message(token, flex)
+def reply_flex(token, bubble_dict):
+    msg = FlexSendMessage(
+        alt_text="詐騙偵測結果",
+        contents=bubble_dict,
+        quick_reply=COMMON_QR
+    )
+    line_bot_api.reply_message(token, msg)
 
-# if False:
-#     def reply_to_user(token, text):
-#         url = "https://api.line.me/v2/bot/message/reply"
-#         headers = {"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
-#                 "Content-Type":"application/json"}
-#         payload = {"replyToken": token,
-#                 "messages":[{"type":"text","text":text}]}
-#         r = requests.post(url, headers=headers, data=json.dumps(payload))
-#         app.logger.info(f"LINE reply status: {r.status_code}")   # <── 新增
-#         if r.status_code != 200:
-#             app.logger.error(r.text)
+def explain_classification(user_id: str) -> str:
+    # 你需要先把這個 user 的最後一次分類結果存在某個全域 dict 裡
+    last = STATE[user_id].get("last_result")
+    prompt = (
+      f"我剛剛偵測到一個訊息，分類結果為階段 {last['stage']}，"
+      f"觸發因子有 {','.join(last['labels'])}。"
+      "請用 2～3 句話簡單說明為何會做出這樣的判斷。"
+    )
+    rsp = openai.ChatCompletion.create(
+      model="gpt-4o-mini",
+      messages=[{"role":"user", "content":prompt}]
+    )
+    return rsp.choices[0].message.content.strip()
+
+def prevention_suggestions(user_id: str) -> str:
+    last = STATE[user_id].get("last_result")
+    prompt = (
+      f"根據詐騙階段 {last['stage']}（{STAGE_INFO[last['stage']][0]}），"
+      f"觸發因子 {','.join(last['labels'])}，"
+      "請列出 3 條最實用的防範建議。"
+    )
+    rsp = openai.ChatCompletion.create(
+      model="gpt-4o-mini",
+      messages=[{"role":"user", "content":prompt}]
+    )
+    return rsp.choices[0].message.content.strip()
+
+from linebot.models import QuickReply, QuickReplyButton, MessageAction
+
+# 定義 quick reply
+COMMON_QR = QuickReply(items=[
+    QuickReplyButton(action=MessageAction(label="下一段偵測", text="下一段偵測")),
+    QuickReplyButton(action=MessageAction(label="聊聊更多", text="聊聊更多")),
+])
 
 #驗證
 @app.route("/callback", methods=["POST"])
 def line_callback():
-    app.logger.info(">>> ENTER /callback") 
-    signature = request.headers.get("X-Line-Signature", "")
-    if signature in ("", "test"):
-        app.logger.info("signature empty, bypass verify")
-        data = json.loads(request.data.decode("utf-8"))
-
-    body_bytes = request.get_data()
-    hash_bytes = hmac.new(CHANNEL_SECRET.encode(), body_bytes, hashlib.sha256).digest()
+    signature = request.headers.get("X-Line-Signature","")
+    body   = request.get_data(as_text=True)
+    hash_bytes = hmac.new(CHANNEL_SECRET.encode(), body.encode("utf-8"), hashlib.sha256).digest()
     if not hmac.compare_digest(base64.b64encode(hash_bytes).decode(), signature):
-        return "invalid sig", 403  
-    
-    payload = json.loads(body_bytes.decode("utf-8"))
-    for ev in payload.get("events", []):
-        if ev.get("type") == "message" and ev["message"]["type"] == "text":
-            token = ev["replyToken"]  
-            user_text = ev["message"]["text"]
+        abort(403)
 
-            result = analyze_text(user_text)
+    events = json.loads(request.get_data(as_text=True)).get("events", [])
+    for ev in events:
+        user_id   = ev["source"]["userId"]
+        reply_tok = ev.get("replyToken") 
+
+        if ev["type"]=="message" and ev["message"]["type"]=="text":
+            uid = ev["source"]["userId"]
+            tok = ev["replyToken"]
+            txt = ev["message"]["text"]
+
+        # Postback
+        if ev["type"] == "postback":
+            data = ev["postback"]["data"]
+            last = STATE[uid].get("last_result", {})
+            if data=="action=explain":    reply_text(tok, explain_classification(uid))
+            elif data=="action=prevent":  reply_text(tok, prevention_suggestions(uid))
+            continue
+
+        # 純文字訊息處理
+        elif ev["type"]=="message" and ev["message"]["type"]=="text":
+            txt = ev["message"]["text"]
+
+            # 下一段偵測：重置狀態，提示使用者傳下一段
+            if txt == "下一段偵測":
+                bubble = {
+                  "type":"bubble",
+                  "body":{"type":"box","layout":"vertical","contents":[
+                    {"type":"text",
+                     "text":"📩 請傳送下一段對話，我會重新開始偵測。",
+                     "wrap":True}
+                  ]}
+                }
+                reply_flex(tok, bubble)
+                continue
+
+            # 聊聊更多：用歷史當 context，交給 ChatGPT 延伸回覆
+            if txt == "聊聊更多":
+                history = user_chat_history.get(uid, [])
+                prompt  = "以下是我和對方的對話紀錄：\n" + "\n".join(history)
+                rsp = openai.ChatCompletion.create(
+                  model="gpt-4o-mini",
+                  messages=[{"role":"user","content":prompt}]
+                )
+                reply_text(tok, rsp.choices[0].message.content)
+                continue
+
+            # 分析
+            result = analyze_text(txt)
+            STATE[uid]["last_result"] = result
+            user_chat_history.setdefault(uid, []).append(txt)
+
+            bubble = build_flex_bubble(result)
+            reply_flex(tok, bubble)
+
+            # 按「下一段偵測」
+            reply_text(ev["replyToken"], "請傳送下一段對話，我會重新開始偵測。")
+
+            # FlexMessage + quick reply
             flex = build_flex_result(result)
-
-            line_bot_api.reply_message(token, flex)
+            reply_flex(reply_tok, flex)
 
     return "OK", 200
 
-# if False:
-#     data = json.loads(body_bytes.decode("utf-8"))
-#     for ev in data.get("events", []):
-#         if ev.get("type") == "message" and ev["message"]["type"] == "text":
-#             user_text = ev["message"]["text"]
-#             app.logger.info(f"  event type={ev['type']} text={user_text}")
-#             result = analyze_text(user_text)
-#             flex = build_flex_result(result)
-#             reply_flex(ev["replyToken"], flex)
-#     app.logger.info("<<< LEAVE /callback")
-#         return "OK", 200
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5080)
+if __name__=="__main__":
+    app.run(port=5080)
